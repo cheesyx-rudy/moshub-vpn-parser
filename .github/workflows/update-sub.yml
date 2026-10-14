@@ -1,0 +1,88 @@
+name: Update MosHub subscription
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: moshub-subscription-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout parser
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install aiohttp aiohttp_socks
+
+      - name: Install Xray-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip \
+            --output xray.zip
+          mkdir -p xray_bin
+          unzip -o xray.zip -d xray_bin
+          sudo install -m 0755 xray_bin/xray /usr/local/bin/xray
+          xray version
+
+      - name: Run parser and health checks
+        run: python merge_subscriptions.py
+
+      - name: Validate output before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s output/sub.txt || { echo "ERROR: output/sub.txt missing or empty; MosHub will not be changed."; exit 1; }
+          COUNT=$(grep -cE '^(vless|vmess|trojan|ss|ssr|hysteria2|hy2|tuic)://' output/sub.txt || true)
+          echo "Configs in output: ${COUNT}"
+          if [ "${COUNT}" -lt 1 ]; then
+            echo "ERROR: no proxy configs in output; MosHub will not be changed."
+            exit 1
+          fi
+
+      - name: Publish subscription to MosHub main branch
+        shell: bash
+        env:
+          MOSHUB_REPO: ${{ secrets.MOSHUB_REPO }}
+          MOSHUB_USERNAME: ${{ secrets.MOSHUB_USERNAME }}
+          MOSHUB_TOKEN: ${{ secrets.MOSHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MOSHUB_REPO}" || -z "${MOSHUB_USERNAME}" || -z "${MOSHUB_TOKEN}" ]]; then
+            echo "ERROR: configure MOSHUB_REPO, MOSHUB_USERNAME and MOSHUB_TOKEN in repository Actions secrets."
+            exit 1
+          fi
+
+          # Avoid printing credentials. The token is only used by this ephemeral runner.
+          AUTH_REPO="https://${MOSHUB_USERNAME}:${MOSHUB_TOKEN}@${MOSHUB_REPO#https://}"
+          rm -rf moshub_repo
+          git clone --quiet --branch main "${AUTH_REPO}" moshub_repo
+          install -m 0644 output/sub.txt moshub_repo/sub.txt
+
+          cd moshub_repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sub.txt
+          if git diff --cached --quiet; then
+            echo "No subscription changes; nothing to push."
+            exit 0
+          fi
+          git commit -m "auto: update subscription $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push origin HEAD:main
+          echo "Subscription published to MosHub main/sub.txt"
